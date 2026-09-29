@@ -4,13 +4,13 @@ At every 5-minute boundary it predicts P(Up) for the window that just opened (an
 15-minute window on quarter hours), then, every POLL seconds inside each window, blends the
 prior with the move so far into a fair value and compares it with the Polymarket order
 book. Everything is paper-only: it logs predictions, outcomes, running accuracy and the
-PnL of hypothetical 1-share buys whenever edge = fair - ask exceeds --min-edge.
+PnL of hypothetical 1-share buys whenever fair - ask - taker fee exceeds --min-edge.
 
 Price feed: Bitstamp (matches the training data), falling back to Coinbase, then Binance.
 Polymarket resolves on the Chainlink BTC/USD stream; exchange prices are a proxy for it.
 
-    python live.py [--min-edge 0.03] [--poll 15]
-Outputs: logs/live_predictions.csv, logs/live_quotes.csv, logs/live_summary.json
+    python live.py [--min-edge 0.03] [--poll 15] [--duration MINUTES]
+Outputs: logs/live_predictions.csv, logs/quotes/YYYY-MM-DD.csv, logs/live_summary.json
 """
 import argparse
 import csv
@@ -24,7 +24,7 @@ import numpy as np
 import requests
 from btcpred.predictor import Predictor
 
-LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG = os.environ.get("LIVE_LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"))
 HIST = 3000  # minutes of history the features need
 S = requests.Session()
 S.headers["User-Agent"] = "btcpred/1.0"
@@ -124,19 +124,46 @@ def spot():
 
 
 # ---------------------------------------------------------------- polymarket
-def pm_market(H, start):
-    """Up/Down token ids for the window starting at `start` (unix s), or None."""
-    for slug in (f"btc-updown-{H}m-{start}",):
+def _jl(x):
+    return json.loads(x) if isinstance(x, str) else x
+
+
+def _gamma(slug):
+    """Gamma market record for a slug (tries the markets and events endpoints)."""
+    for path, pick in (("markets", lambda js: js[0]), ("events", lambda js: js[0]["markets"][0])):
         try:
-            r = S.get("https://gamma-api.polymarket.com/markets", params={"slug": slug}, timeout=10)
-            js = r.json()
+            js = S.get(f"https://gamma-api.polymarket.com/{path}", params={"slug": slug}, timeout=10).json()
             if js:
-                m = js[0]
-                ids = json.loads(m["clobTokenIds"])
-                outs = [o.lower() for o in json.loads(m["outcomes"])]
-                return {"slug": slug, "up": ids[outs.index("up")], "down": ids[outs.index("down")]}
+                return pick(js)
         except Exception:
             pass
+    return None
+
+
+def pm_market(H, start):
+    """Up/Down token ids for the window starting at `start` (unix s), or None."""
+    slug = f"btc-updown-{H}m-{start}"
+    m = _gamma(slug)
+    if not m:
+        return None
+    try:
+        ids = _jl(m["clobTokenIds"])
+        outs = [o.lower() for o in _jl(m["outcomes"])]
+        return {"slug": slug, "up": ids[outs.index("up")], "down": ids[outs.index("down")]}
+    except Exception:
+        return None
+
+
+def pm_outcome(slug):
+    """1 if Polymarket resolved Up, 0 if Down, None if not resolved yet."""
+    m = _gamma(slug)
+    try:
+        outs = [o.lower() for o in _jl(m["outcomes"])]
+        px = [float(x) for x in _jl(m["outcomePrices"])]
+        if max(px) > 0.99:
+            return int(outs[px.index(max(px))] == "up")
+    except Exception:
+        pass
     return None
 
 
@@ -150,8 +177,13 @@ def pm_ask(token):
         return None, None
 
 
+def taker_fee(p):
+    """Polymarket crypto-market taker fee per share: p * 0.25 * (p(1-p))^2 (max 1.56% at 0.50)."""
+    return p * 0.25 * (p * (1 - p)) ** 2
+
+
 # ---------------------------------------------------------------- fair value
-def fair_up(prior, s0, st, sigma1m, secs_left):
+def fair_up(prior, s0, st, sigma1m, secs_left, H):
     """P(close >= s0) given the current price st, blending the model prior as a drift tilt.
 
     The prior at window open implies a drift z0 = Phi^-1(prior) over the full window; the
@@ -162,10 +194,7 @@ def fair_up(prior, s0, st, sigma1m, secs_left):
     tau = secs_left / 60.0
     z0 = _ppf(min(max(prior, 1e-4), 1 - 1e-4))
     sd = sigma1m * math.sqrt(tau)
-    return _cdf((math.log(st / s0) / sd) + z0 * math.sqrt(tau / fair_up.H))
-
-
-fair_up.H = 5
+    return _cdf((math.log(st / s0) / sd) + z0 * math.sqrt(tau / H))
 
 
 def _cdf(x):
@@ -180,19 +209,30 @@ def _ppf(p):
     return (lo + hi) / 2
 
 
-# ---------------------------------------------------------------- main loop
+# ---------------------------------------------------------------- bookkeeping
 class Book:
+    """Predictions, open windows and running stats; persisted so restarts resume cleanly."""
+
     def __init__(self):
-        os.makedirs(LOG, exist_ok=True)
+        os.makedirs(os.path.join(LOG, "quotes"), exist_ok=True)
         self.pred_path = os.path.join(LOG, "live_predictions.csv")
-        self.quote_path = os.path.join(LOG, "live_quotes.csv")
         self.sum_path = os.path.join(LOG, "live_summary.json")
         self.open = {}  # (H, start) -> dict
-        self.stats = {str(H): {"n": 0, "correct": 0, "trades": 0, "pnl": 0.0} for H in (5, 15)}
+        blank = {"n": 0, "correct": 0, "pm_n": 0, "pm_correct": 0, "trades": 0, "wins": 0, "pnl": 0.0}
+        self.stats = {str(H): dict(blank) for H in (5, 15)}
         if os.path.exists(self.sum_path):
-            self.stats.update(json.load(open(self.sum_path)).get("stats", {}))
+            js = json.load(open(self.sum_path))
+            for H, st in js.get("stats", {}).items():
+                self.stats[H].update({k: v for k, v in st.items() if k in blank})
+            for k, w in js.get("open", {}).items():
+                H, start = map(int, k.split(":"))
+                w["fills"] = [tuple(f) for f in w.get("fills", [])]
+                self.open[(H, start)] = w
 
-    def _append(self, path, row):
+    def quote_path(self):
+        return os.path.join(LOG, "quotes", time.strftime("%Y-%m-%d.csv", time.gmtime()))
+
+    def append(self, path, row):
         new = not os.path.exists(path)
         with open(path, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(row))
@@ -201,85 +241,119 @@ class Book:
             w.writerow(row)
 
     def save(self):
-        out = {"updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "stats": self.stats}
-        for H, s in self.stats.items():
-            s["accuracy"] = s["correct"] / s["n"] if s["n"] else None
-        json.dump(out, open(self.sum_path, "w"), indent=1)
+        for s in self.stats.values():
+            s["accuracy"] = round(s["correct"] / s["n"], 4) if s["n"] else None
+            s["pm_accuracy"] = round(s["pm_correct"] / s["pm_n"], 4) if s["pm_n"] else None
+            s["pnl"] = round(s["pnl"], 4)
+        out = {"updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "stats": self.stats,
+               "open": {f"{H}:{t}": w for (H, t), w in self.open.items()}}
+        tmp = self.sum_path + ".tmp"
+        json.dump(out, open(tmp, "w"), indent=1)
+        os.replace(tmp, self.sum_path)
+
+    def resolve(self, d, boundary):
+        """Close windows that have ended. Prefers Polymarket's own resolution (Chainlink) and
+        waits up to 30 minutes for it; falls back to the exchange close."""
+        for key in sorted(k for k in self.open if k[1] + 60 * k[0] <= boundary):
+            H, start = key
+            w = self.open[key]
+            end_t = start + 60 * H
+            end = d["c"][d["ts"] == end_t]
+            if not len(end):
+                if boundary - end_t > 3600:
+                    self.open.pop(key)  # too old to resolve from the candle window
+                continue
+            pm = pm_outcome(w["mkt"]["slug"]) if w.get("mkt") else None
+            if pm is None and w.get("mkt") and boundary - end_t < 1800:
+                continue
+            self.open.pop(key)
+            ex_up = int(end[0] >= w["s0"])
+            up = ex_up if pm is None else pm
+            st = self.stats[str(H)]
+            st["n"] += 1
+            st["correct"] += int((w["p"] >= 0.5) == ex_up)
+            if pm is not None:
+                st["pm_n"] += 1
+                st["pm_correct"] += int((w["p"] >= 0.5) == pm)
+            for side, px in w.get("fills", []):
+                win = (side == "up") == bool(up)
+                st["trades"] += 1
+                st["wins"] += int(win)
+                st["pnl"] += (1.0 if win else 0.0) - px - taker_fee(px)
+            self.append(self.pred_path, {
+                "start_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(start)), "start": start, "horizon": H,
+                "feed": w["feed"], "s0": w["s0"], "s_end": float(end[0]), "p_up": round(w["p"], 4),
+                "exchange_up": ex_up, "polymarket_up": "" if pm is None else pm,
+                "fills": json.dumps(w.get("fills", []))})
 
 
+# ---------------------------------------------------------------- main loop
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--min-edge", type=float, default=0.03, help="fair - ask needed to paper-buy")
+    ap.add_argument("--min-edge", type=float, default=0.03,
+                    help="fair value - ask - taker fee needed to paper-buy one share")
     ap.add_argument("--poll", type=int, default=15, help="seconds between in-window quotes")
+    ap.add_argument("--duration", type=float, default=0, help="exit cleanly after N minutes (0 = never)")
     ap.add_argument("--once", action="store_true", help="make one prediction and exit")
     args = ap.parse_args()
     model = Predictor()
     book = Book()
     last_boundary = None
-    log("started; models loaded")
-    while True:
+    t_end = time.time() + 60 * args.duration if args.duration else float("inf")
+    log(f"started; models loaded; {len(book.open)} open windows restored")
+    while time.time() < t_end:
         try:
             now = time.time()
             boundary = int(now // 300 * 300)
             if boundary != last_boundary and 2 <= now - boundary < 120:
                 feed, d = candles(boundary)
+                if d["ts"][-1] != boundary:
+                    raise RuntimeError(f"{feed}: candle closing at the boundary not published yet")
                 last_boundary = boundary  # only after a successful fetch, so failures retry
                 s0 = float(d["c"][-1])
                 p = model.predict(d)
-                # resolve windows that have ended
-                for key in [k for k in book.open if k[1] + 60 * k[0] <= boundary]:
-                    w = book.open.pop(key)
-                    end = d["c"][d["ts"] == key[1] + 60 * key[0]]
-                    if not len(end):
-                        continue
-                    up = int(end[0] >= w["s0"])
-                    st = book.stats[str(key[0])]
-                    st["n"] += 1
-                    st["correct"] += int((w["p"] >= 0.5) == up)
-                    for side, px in w.get("fills", []):
-                        st["trades"] += 1
-                        st["pnl"] += (1.0 if (side == "up") == bool(up) else 0.0) - px
-                    book._append(book.pred_path, {"start": key[1], "horizon": key[0], "feed": w["feed"],
-                                                  "s0": w["s0"], "s_end": float(end[0]), "p_up": round(w["p"], 4),
-                                                  "outcome_up": up, "fills": json.dumps(w.get("fills", []))})
+                book.resolve(d, boundary)
                 for H in (5, 15):
                     if boundary % (60 * H) == 0:
+                        mkt = pm_market(H, boundary)
                         book.open[(H, boundary)] = {"p": p[H], "s0": s0, "feed": feed, "sigma": p["sigma1m"],
-                                                    "mkt": pm_market(H, boundary), "fills": []}
+                                                    "mkt": mkt, "fills": []}
                         log(f"{H:>2}m window {time.strftime('%H:%M', time.gmtime(boundary))} "
                             f"P(up)={p[H]:.4f} s0={s0:.2f} feed={feed} "
-                            f"polymarket={'found' if book.open[(H, boundary)]['mkt'] else 'n/a'}")
+                            f"polymarket={mkt['slug'] if mkt else 'not found'}")
                 book.save()
                 if args.once:
                     return
             # in-window quotes vs Polymarket
             st_px = spot()
             for (H, start), w in list(book.open.items()):
-                if st_px is None or not w["mkt"]:
-                    continue
                 left = start + 60 * H - time.time()
-                fair_up.H = H
-                fu = fair_up(w["p"], w["s0"], st_px, w["sigma"], left)
-                au, _ = pm_ask(w["mkt"]["up"])
-                ad, _ = pm_ask(w["mkt"]["down"])
-                row = {"t": int(time.time()), "horizon": H, "start": start, "spot": st_px, "fair_up": round(fu, 4),
-                       "ask_up": au, "ask_down": ad,
-                       "edge_up": None if au is None else round(fu - au, 4),
-                       "edge_down": None if ad is None else round((1 - fu) - ad, 4)}
-                book._append(book.quote_path, row)
+                if st_px is None or not w["mkt"] or left <= 0:
+                    continue
+                fu = fair_up(w["p"], w["s0"], st_px, w["sigma"], left, H)
+                au, su = pm_ask(w["mkt"]["up"])
+                ad, sd = pm_ask(w["mkt"]["down"])
+                eu = None if au is None else round(fu - au - taker_fee(au), 4)
+                ed = None if ad is None else round((1 - fu) - ad - taker_fee(ad), 4)
+                book.append(book.quote_path(), {
+                    "t": int(time.time()), "horizon": H, "start": start, "secs_left": int(left), "spot": st_px,
+                    "fair_up": round(fu, 4), "ask_up": au, "ask_up_size": su, "ask_down": ad,
+                    "ask_down_size": sd, "edge_up": eu, "edge_down": ed})
                 sides = {s for s, _ in w["fills"]}
-                for side, edge, px in (("up", row["edge_up"], au), ("down", row["edge_down"], ad)):
+                for side, edge, px in (("up", eu, au), ("down", ed, ad)):
                     if edge is not None and edge >= args.min_edge and side not in sides and left > 10:
                         w["fills"].append((side, px))
-                        log(f"paper BUY {side} {H}m @ {px} fair={fu:.3f} edge={edge:.3f}")
+                        log(f"paper BUY {side} {H}m @ {px} fair={fu:.3f} edge_after_fee={edge:.3f}")
         except KeyboardInterrupt:
-            raise
+            break
         except Exception as e:
             log("error:", e)
             if "--debug" in sys.argv:
                 traceback.print_exc()
             time.sleep(20)
         time.sleep(args.poll)
+    book.save()
+    log("stopped")
 
 
 if __name__ == "__main__":

@@ -68,16 +68,40 @@ windows a bettor would actually trade.
 
 ## Live estimator
 
+`live.py` predicts every Polymarket BTC 5m / 15m window at its open, then every 15 s
+compares its fair value (model prior blended with the move so far) with the Polymarket
+best ask, net of the crypto taker fee (`shares × p × 0.25 × (p(1−p))²`). It paper-buys one
+share when the edge after fees is at least `--min-edge` (default 0.03). No orders are placed.
+
+### Running on GitHub Actions (no computer needed)
+
+`.github/workflows/live.yml` chains 100 stints of about 6 hours each (≈25 days) on GitHub's
+runners. Each stint restores the previous stint's state from the committed logs.
+
+* **Start:** any push to this branch that changes `live.py`, `btcpred/`, `models/` or
+  `.github/` starts a new run and cancels the old one. After a run ends, open it in the
+  Actions tab and choose *Re-run all jobs*.
+* **Stop:** Actions tab → the running *live* workflow → *Cancel workflow run*.
+* **Results:** committed back to this branch every 15 minutes:
+  * `logs/live_summary.json`: running accuracy (exchange-based and Polymarket-resolved),
+    paper trades, wins and PnL after fees
+  * `logs/live_predictions.csv`: one row per window (prediction and both outcomes)
+  * `logs/quotes/YYYY-MM-DD.csv`: fair value vs. best asks and edge, every 15 s
+  * `logs/live_stdout.txt`: runner log
+
+Actions on a fork may need enabling once (Actions tab → enable workflows). GitHub's terms
+limit Actions to work related to the repository's software; a long-running monitor is a
+gray area and GitHub may disable it.
+
+### Running locally
+
 ```
 pip install -r requirements.txt
 python live.py --min-edge 0.03 --poll 15
 ```
 
 Needs outbound access to `www.bitstamp.net` (or `api.exchange.coinbase.com` /
-`api.binance.com`), `gamma-api.polymarket.com` and `clob.polymarket.com`. It logs to
-`logs/live_predictions.csv` (prediction and realised outcome per window),
-`logs/live_quotes.csv` (fair value vs best ask every poll) and `logs/live_summary.json`
-(running accuracy and paper PnL). Stop it with Ctrl-C / `kill`. No orders are placed.
+`api.binance.com`), `gamma-api.polymarket.com` and `clob.polymarket.com`.
 
 ## Rebuild from scratch
 
