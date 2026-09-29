@@ -75,11 +75,12 @@ share when the edge after fees is at least `--min-edge` (default 0.03). No order
 
 ### Running on GitHub Actions (no computer needed)
 
-`.github/workflows/live.yml` chains 100 stints of about 6 hours each (≈25 days) on GitHub's
-runners. Each stint restores the previous stint's state from the committed logs.
+`.github/workflows/live.yml` runs 100 stints of about 6 hours each (≈25 days) one after
+another on GitHub's runners (a matrix with `max-parallel: 1`). Each stint restores the
+previous stint's state from the committed logs.
 
-* **Start:** any push to this branch that changes `live.py`, `btcpred/`, `models/` or
-  `.github/` starts a new run and cancels the old one. After a run ends, open it in the
+* **Start:** a push to this branch that changes `live.py`, `btcpred/`, `models/` or the
+  workflow starts a new run and cancels the old one. After a run ends, open it in the
   Actions tab and choose *Re-run all jobs*.
 * **Stop:** Actions tab → the running *live* workflow → *Cancel workflow run*.
 * **Results:** committed back to this branch every 15 minutes:
