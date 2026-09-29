@@ -1,26 +1,91 @@
-### 🟪  user.js
-A `user.js` is a configuration file that can control Firefox settings - for a more technical breakdown and explanation, you can read more in the [wiki](https://github.com/arkenfox/user.js/wiki/2.1-User.js)
+# BTC 5m / 15m Up-Down classifier for Polymarket
 
-### 🟩  the arkenfox user.js
+Predicts whether BTC/USD closes a Polymarket 5-minute or 15-minute window at or above its
+opening price ("Up" resolves on `>=`), and runs a paper-only live estimator that compares
+the model's fair value with the Polymarket order book.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+## Data
 
-The `arkenfox user.js` is a **template** which aims to provide as much privacy and enhanced security as possible, and to reduce tracking and fingerprinting as much as possible - while minimizing any loss of functionality and breakage (but it will happen).
+The session's network policy blocked every exchange, Polymarket and Chainlink endpoint, so
+the only bulk source reachable was
+[ff137/bitstamp-btcusd-minute-data](https://github.com/ff137/bitstamp-btcusd-minute-data):
+Bitstamp BTC/USD 1-minute candles, 2012 → 2026-09-29 (6.7 M minutes used, from 2014).
+ETH, LTC and XMR history could not be downloaded, so the "massive pretraining" corpus is
+the full BTC history rather than multi-asset data.
 
-Everyone, experts included, should at least read the [wiki](https://github.com/arkenfox/user.js/wiki), as it contains important information regarding a few `user.js` settings.
+Clone it and point `BTC_MINUTE_REPO` at it (default `/home/user/ff137/bitstamp-btcusd-minute-data`).
 
-Note that we do *not* recommend connecting over Tor on Firefox. Use the [Tor Browser](https://www.torproject.org/projects/torbrowser.html.en) if your [threat model](https://2019.www.torproject.org/about/torusers.html) calls for it, or for accessing hidden services.
+## Splits (strictly chronological, 1-day embargo at each edge)
 
-Also be aware that the `arkenfox user.js` is made specifically for desktop Firefox. Using it as-is in other Gecko-based browsers can be counterproductive, especially in the Tor Browser.
+| split    | period                  | role                                   |
+|----------|-------------------------|----------------------------------------|
+| pretrain | 2014-03 → 2022-12       | NN pretraining                         |
+| finetune | 2023-01 → 2025-09       | NN fine-tuning, GBM training           |
+| val      | 2025-10 → 2026-03       | early stopping, ensemble weight        |
+| test     | 2026-04 → 2026-09-28    | untouched backtest                     |
 
-### 🟧  sitemap
+Evaluation uses only Polymarket-aligned windows (start at :00/:05/… for 5m, :00/:15/… for 15m).
 
- - [releases](https://github.com/arkenfox/user.js/releases)
- - [changelogs](https://github.com/arkenfox/user.js/issues?utf8=%E2%9C%93&q=is%3Aissue+label%3Achangelog)
- - [wiki](https://github.com/arkenfox/user.js/wiki)
- - [stickies](https://github.com/arkenfox/user.js/issues?q=is%3Aissue+is%3Aopen+label%3A%22sticky+topic%22)
- - [diffs](https://github.com/arkenfox/user.js/issues?q=is%3Aissue+label%3Adiffs)
- - [common questions and answers](https://github.com/arkenfox/user.js/issues?q=is%3Aissue+label%3Aanswered)
+## Models
 
-### 🟥  acknowledgments
-Literally thousands of sources, references and suggestions. Many thanks, and much appreciated.
+* `train_gbm.py` – LightGBM on 44 causal features (multi-lag vol-normalised returns, EMA
+  deviations, realised-vol regime, range position, volume and signed-volume, time of day /
+  week, position in the 15-minute block).
+* `train_nn.py` – tabular MLP + dilated 1-D CNN over the last 64 minutes, multi-task
+  (Up@5m, Up@15m, auxiliary return regression). Pretrained on 2014–2022, fine-tuned on
+  2023–2025Q3.
+* `ensemble.py` – blends the two with a weight chosen on validation log-loss; writes
+  `models/ensemble.json` and `logs/backtest.json`.
+* `walkforward.py` – retrains the GBM on earlier windows and scores the following 6 months.
+* `refit_live.py` – refits the GBMs on 2023-01 → latest data into `models/live/`; the live
+  runner uses these (the NN and ensemble weights are unchanged from the backtest).
+
+## Results (test set, 2026-04-01 → 2026-09-28)
+
+| horizon | test windows | accuracy (±1 SE) | top 50 % | top 20 % | top 10 % | Up base rate |
+|---|---|---|---|---|---|---|
+| 5m | 51,870 | **52.46 %** (±0.22) | 54.0 % | 56.1 % | 57.1 % | 50.12 % |
+| 15m | 17,290 | **52.75 %** (±0.38) | 54.7 % | 56.2 % | 55.3 % | 49.70 % |
+
+Component models on the same test set: GBM 52.30 % / 52.88 %, NN 52.04 % / 52.48 % (5m / 15m).
+Walk-forward GBM refits on four earlier 6-month periods (2023-10 → 2025-09): 5m 51.4–52.3 %,
+15m 52.2–53.7 % (`walkforward.py`, `logs/walkforward.log`).
+
+"Top 10 %" is accuracy on the tenth of windows where the model is most confident, i.e. the
+windows a bettor would actually trade.
+
+## Caveats
+
+* Trained and tested on Bitstamp last-trade prices. Polymarket settles on the Chainlink
+  BTC/USD Data Stream (a cross-exchange aggregate); part of any edge that comes from
+  Bitstamp microstructure will not transfer. Lagging all features by 10 minutes still left
+  51.4 % test accuracy on 5m, so most of the signal is not last-minute noise.
+* The 50 % baseline ignores Polymarket prices: the market often prices Up away from 0.50,
+  and taker fees plus the spread must be beaten. No historical Polymarket books were
+  reachable, so edge versus the actual market is only measured by the live runner.
+* Accuracy varies month to month (≈49.5–55 % on 5m); ±0.22 % is one standard error on the
+  full 5m test set.
+
+## Live estimator
+
+```
+pip install -r requirements.txt
+python live.py --min-edge 0.03 --poll 15
+```
+
+Needs outbound access to `www.bitstamp.net` (or `api.exchange.coinbase.com` /
+`api.binance.com`), `gamma-api.polymarket.com` and `clob.polymarket.com`. It logs to
+`logs/live_predictions.csv` (prediction and realised outcome per window),
+`logs/live_quotes.csv` (fair value vs best ask every poll) and `logs/live_summary.json`
+(running accuracy and paper PnL). Stop it with Ctrl-C / `kill`. No orders are placed.
+
+## Rebuild from scratch
+
+```
+python -m btcpred.data          # 1-minute grid cache
+python train_gbm.py             # GBM
+python train_nn.py 3 5          # NN: pretrain epochs, fine-tune epochs
+python ensemble.py              # blend + backtest
+python walkforward.py           # optional robustness check
+python refit_live.py            # refit GBMs on all recent data for live use
+```
