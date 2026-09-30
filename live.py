@@ -1,10 +1,12 @@
 """Live BTC Up/Down estimator for Polymarket 5m / 15m markets. Runs until killed.
 
-At every 5-minute boundary it predicts P(Up) for the window that just opened (and the
-15-minute window on quarter hours), then, every POLL seconds inside each window, blends the
-prior with the move so far into a fair value and compares it with the Polymarket order
-book. Everything is paper-only: it logs predictions, outcomes, running accuracy and the
-PnL of hypothetical 1-share buys whenever fair - ask - taker fee exceeds --min-edge.
+At every 5-minute boundary it predicts a calibrated P(Up) for the window that just opened
+(and the 15-minute window on quarter hours), with a confidence tier and the models'
+disagreement. Every POLL seconds inside each window, the partial-window model turns the
+move so far and the time left into a fair value, which is compared with the Polymarket
+order book net of taker fees, together with a Kelly stake fraction. Everything is paper-only:
+it logs predictions, outcomes, running accuracy (overall, per tier, rolling with a drift
+warning) and the PnL of hypothetical 1-share buys whenever fair - ask - fee >= --min-edge.
 
 Price feed: Bitstamp (matches the training data), falling back to Coinbase, then Binance.
 Polymarket resolves on the Chainlink BTC/USD stream; exchange prices are a proxy for it.
@@ -210,16 +212,27 @@ def _ppf(p):
 
 
 # ---------------------------------------------------------------- bookkeeping
+def kelly(q, ask):
+    """Kelly fraction of bankroll for buying a share at `ask` (+ taker fee) that pays 1 with
+    probability q. Staking a quarter of this is the usual hedge against model error."""
+    if ask is None:
+        return None
+    cost = ask + taker_fee(ask)
+    return round(max(0.0, (q - cost) / (1 - cost)), 4) if cost < 1 else 0.0
+
+
 class Book:
     """Predictions, open windows and running stats; persisted so restarts resume cleanly."""
+    RECENT = 500  # windows in the rolling accuracy used for the drift warning
 
     def __init__(self):
         os.makedirs(os.path.join(LOG, "quotes"), exist_ok=True)
         self.pred_path = os.path.join(LOG, "live_predictions.csv")
         self.sum_path = os.path.join(LOG, "live_summary.json")
         self.open = {}  # (H, start) -> dict
-        blank = {"n": 0, "correct": 0, "pm_n": 0, "pm_correct": 0, "trades": 0, "wins": 0, "pnl": 0.0}
-        self.stats = {str(H): dict(blank) for H in (5, 15)}
+        blank = {"n": 0, "correct": 0, "pm_n": 0, "pm_correct": 0, "trades": 0, "wins": 0, "pnl": 0.0,
+                 "brier_sum": 0.0, "tiers": {}, "recent": []}
+        self.stats = {str(H): json.loads(json.dumps(blank)) for H in (5, 15)}
         if os.path.exists(self.sum_path):
             js = json.load(open(self.sum_path))
             for H, st in js.get("stats", {}).items():
@@ -244,34 +257,46 @@ class Book:
         for s in self.stats.values():
             s["accuracy"] = round(s["correct"] / s["n"], 4) if s["n"] else None
             s["pm_accuracy"] = round(s["pm_correct"] / s["pm_n"], 4) if s["pm_n"] else None
+            s["brier"] = round(s["brier_sum"] / s["n"], 5) if s["n"] else None
             s["pnl"] = round(s["pnl"], 4)
+            s["tier_accuracy"] = {t: round(c / n, 4) for t, (n, c) in s["tiers"].items() if n}
+            rec = s["recent"]
+            s["recent_accuracy"] = round(sum(rec) / len(rec), 4) if rec else None
+            # a coin flip over 300+ windows stays above 50 % less than half the time; below 49 % is a warning
+            s["drift_warning"] = bool(len(rec) >= 300 and sum(rec) / len(rec) < 0.49)
         out = {"updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "stats": self.stats,
                "open": {f"{H}:{t}": w for (H, t), w in self.open.items()}}
         tmp = self.sum_path + ".tmp"
         json.dump(out, open(tmp, "w"), indent=1)
         os.replace(tmp, self.sum_path)
 
-    def resolve(self, d, boundary):
+    def resolve(self, d, now_t):
         """Close windows that have ended. Prefers Polymarket's own resolution (Chainlink) and
         waits up to 30 minutes for it; falls back to the exchange close."""
-        for key in sorted(k for k in self.open if k[1] + 60 * k[0] <= boundary):
+        for key in sorted(k for k in self.open if k[1] + 60 * k[0] <= now_t):
             H, start = key
             w = self.open[key]
             end_t = start + 60 * H
             end = d["c"][d["ts"] == end_t]
             if not len(end):
-                if boundary - end_t > 3600:
+                if now_t - end_t > 3600:
                     self.open.pop(key)  # too old to resolve from the candle window
                 continue
             pm = pm_outcome(w["mkt"]["slug"]) if w.get("mkt") else None
-            if pm is None and w.get("mkt") and boundary - end_t < 1800:
+            if pm is None and w.get("mkt") and now_t - end_t < 1800:
                 continue
             self.open.pop(key)
             ex_up = int(end[0] >= w["s0"])
             up = ex_up if pm is None else pm
+            hit = int((w["p"] >= 0.5) == up)
             st = self.stats[str(H)]
             st["n"] += 1
             st["correct"] += int((w["p"] >= 0.5) == ex_up)
+            st["brier_sum"] += (w["p"] - up) ** 2
+            tn = st["tiers"].setdefault(w.get("tier", "?"), [0, 0])
+            tn[0] += 1
+            tn[1] += hit
+            st["recent"] = (st["recent"] + [hit])[-self.RECENT:]
             if pm is not None:
                 st["pm_n"] += 1
                 st["pm_correct"] += int((w["p"] >= 0.5) == pm)
@@ -283,6 +308,7 @@ class Book:
             self.append(self.pred_path, {
                 "start_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(start)), "start": start, "horizon": H,
                 "feed": w["feed"], "s0": w["s0"], "s_end": float(end[0]), "p_up": round(w["p"], 4),
+                "tier": w.get("tier", ""), "spread": round(w.get("spread", 0.0), 4),
                 "exchange_up": ex_up, "polymarket_up": "" if pm is None else pm,
                 "fills": json.dumps(w.get("fills", []))})
 
@@ -298,59 +324,72 @@ def main():
     args = ap.parse_args()
     model = Predictor()
     book = Book()
-    last_boundary = None
+    last_minute = None
     t_end = time.time() + 60 * args.duration if args.duration else float("inf")
     log(f"started; models loaded; {len(book.open)} open windows restored")
     while time.time() < t_end:
         try:
             now = time.time()
-            boundary = int(now // 300 * 300)
-            if boundary != last_boundary and 2 <= now - boundary < 120:
-                feed, d = candles(boundary)
-                if d["ts"][-1] != boundary:
-                    raise RuntimeError(f"{feed}: candle closing at the boundary not published yet")
-                last_boundary = boundary  # only after a successful fetch, so failures retry
-                s0 = float(d["c"][-1])
+            minute = int(now // 60 * 60)
+            # once a minute: refresh candles and features (the partial-window model uses them)
+            if minute != last_minute and now - minute >= 2:
+                feed, d = candles(minute)
+                if d["ts"][-1] != minute:
+                    raise RuntimeError(f"{feed}: candle closing at {minute} not published yet")
+                last_minute = minute  # only after a successful fetch, so failures retry
                 p = model.predict(d)
-                book.resolve(d, boundary)
-                for H in (5, 15):
-                    if boundary % (60 * H) == 0:
-                        mkt = pm_market(H, boundary)
-                        book.open[(H, boundary)] = {"p": p[H], "s0": s0, "feed": feed, "sigma": p["sigma1m"],
-                                                    "mkt": mkt, "fills": []}
-                        log(f"{H:>2}m window {time.strftime('%H:%M', time.gmtime(boundary))} "
-                            f"P(up)={p[H]:.4f} s0={s0:.2f} feed={feed} "
-                            f"polymarket={mkt['slug'] if mkt else 'not found'}")
+                book.resolve(d, minute)
+                if minute % 300 == 0:
+                    s0 = float(d["c"][-1])
+                    for H in (5, 15):
+                        if minute % (60 * H):
+                            continue
+                        mkt = pm_market(H, minute)
+                        q = p[H]
+                        book.open[(H, minute)] = {"p": q["p_up"], "tier": q["tier"], "confidence": q["confidence"],
+                                                  "spread": q["spread"], "s0": s0, "feed": feed,
+                                                  "sigma": p["sigma1m"], "mkt": mkt, "fills": []}
+                        log(f"{H:>2}m window {time.strftime('%H:%M', time.gmtime(minute))} "
+                            f"P(up)={q['p_up']:.4f} -> {q['side'].upper()} conf={q['confidence']:.3f} "
+                            f"tier={q['tier']} (backtest {q['tier_backtest_acc']:.1%}) spread={q['spread']:.3f} "
+                            f"s0={s0:.2f} feed={feed} polymarket={mkt['slug'] if mkt else 'not found'}")
                 book.save()
-                if args.once:
+                if args.once and minute % 300 == 0:
                     return
-            # in-window quotes vs Polymarket
+            # in-window fair value vs the Polymarket book
             st_px = spot()
             for (H, start), w in list(book.open.items()):
                 left = start + 60 * H - time.time()
                 if st_px is None or not w["mkt"] or left <= 0:
                     continue
-                fu = fair_up(w["p"], w["s0"], st_px, w["sigma"], left, H)
+                elapsed = H - left / 60.0
+                fu, src = None, "analytic"
+                if elapsed >= 1:
+                    fu = model.partial(math.log(st_px / w["s0"]), elapsed, H)
+                    src = "partial_model"
+                if fu is None:
+                    fu, src = fair_up(w["p"], w["s0"], st_px, w["sigma"], left, H), "analytic"
                 au, su = pm_ask(w["mkt"]["up"])
                 ad, sd = pm_ask(w["mkt"]["down"])
                 eu = None if au is None else round(fu - au - taker_fee(au), 4)
                 ed = None if ad is None else round((1 - fu) - ad - taker_fee(ad), 4)
                 book.append(book.quote_path(), {
                     "t": int(time.time()), "horizon": H, "start": start, "secs_left": int(left), "spot": st_px,
-                    "fair_up": round(fu, 4), "ask_up": au, "ask_up_size": su, "ask_down": ad,
-                    "ask_down_size": sd, "edge_up": eu, "edge_down": ed})
+                    "fair_up": round(fu, 4), "source": src, "ask_up": au, "ask_up_size": su, "ask_down": ad,
+                    "ask_down_size": sd, "edge_up": eu, "edge_down": ed,
+                    "kelly_up": kelly(fu, au), "kelly_down": kelly(1 - fu, ad)})
                 sides = {s for s, _ in w["fills"]}
                 for side, edge, px in (("up", eu, au), ("down", ed, ad)):
                     if edge is not None and edge >= args.min_edge and side not in sides and left > 10:
                         w["fills"].append((side, px))
-                        log(f"paper BUY {side} {H}m @ {px} fair={fu:.3f} edge_after_fee={edge:.3f}")
+                        log(f"paper BUY {side} {H}m @ {px} fair={fu:.3f} ({src}) edge_after_fee={edge:.3f}")
         except KeyboardInterrupt:
             break
         except Exception as e:
             log("error:", e)
             if "--debug" in sys.argv:
                 traceback.print_exc()
-            time.sleep(20)
+            time.sleep(5)
         time.sleep(args.poll)
     book.save()
     log("stopped")

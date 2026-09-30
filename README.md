@@ -28,31 +28,70 @@ Evaluation uses only Polymarket-aligned windows (start at :00/:05/… for 5m, :0
 
 ## Models
 
-* `train_gbm.py` – LightGBM on 44 causal features (multi-lag vol-normalised returns, EMA
-  deviations, realised-vol regime, range position, volume and signed-volume, time of day /
-  week, position in the 15-minute block).
-* `train_nn.py` – tabular MLP + dilated 1-D CNN over the last 64 minutes, multi-task
-  (Up@5m, Up@15m, auxiliary return regression). Pretrained on 2014–2022, fine-tuned on
-  2023–2025Q3.
-* `ensemble.py` – blends the two with a weight chosen on validation log-loss; writes
-  `models/ensemble.json` and `logs/backtest.json`.
-* `walkforward.py` – retrains the GBM on earlier windows and scores the following 6 months.
-* `refit_live.py` – refits the GBMs on 2023-01 → latest data into `models/live/`; the live
-  runner uses these (the NN and ensemble weights are unchanged from the backtest).
+* **Pre-window ensemble** (`train_final.py`): five LightGBM variants on 75 causal features
+  (44 original + 31 added: last ten 1-minute moves, move since the day / hour / quarter-hour
+  opened, multi-day trend, distance to round prices, up-minute share, skew, autocorrelation,
+  volume detail) plus the neural net (`train_nn.py`: tabular MLP + dilated 1-D CNN over the last
+  64 minutes, pretrained on 2014–2022 BTC, fine-tuned on 2023–2025Q3). Member logits are averaged,
+  blended with the NN (weight chosen on validation) and Platt-calibrated on validation.
+* **Partial-window model** (`train_intra.py`, `btcpred/intra.py`): P(Up) for a window already in
+  progress, from the regular features plus the move since the open measured against the
+  volatility left (`disp_z`), elapsed and remaining time.
+* `experiments.py` holds the variants tried (features, regression / weighted targets, tree
+  sizes, training spans, recency weighting, extra-trees, aligned-only training); all landed
+  within noise of each other on validation (5m 52.2–52.7 %, 15m 53.4–53.9 %).
 
-## Results (test set, 2026-04-01 → 2026-09-28)
+## Results (test set, 2026-04-01 → 2026-09-28, never used for choices)
 
-| horizon | test windows | accuracy (±1 SE) | top 50 % | top 20 % | top 10 % | Up base rate |
-|---|---|---|---|---|---|---|
-| 5m | 51,870 | **52.46 %** (±0.22) | 54.0 % | 56.1 % | 57.1 % | 50.12 % |
-| 15m | 17,290 | **52.75 %** (±0.38) | 54.7 % | 56.2 % | 55.3 % | 49.70 % |
+### At the window open
 
-Component models on the same test set: GBM 52.30 % / 52.88 %, NN 52.04 % / 52.48 % (5m / 15m).
-Walk-forward GBM refits on four earlier 6-month periods (2023-10 → 2025-09): 5m 51.4–52.3 %,
-15m 52.2–53.7 % (`walkforward.py`, `logs/walkforward.log`).
+| window | test windows | accuracy (±1 SE) | log-loss | calibration error (ECE) |
+|---|---|---|---|---|
+| 5m | 51,870 | **52.41 %** (±0.22) | 0.6909 | 0.46 % |
+| 15m | 17,290 | **52.76 %** (±0.38) | 0.6909 | 1.39 % |
 
-"Top 10 %" is accuracy on the tenth of windows where the model is most confident, i.e. the
-windows a bettor would actually trade.
+Overall test accuracy is unchanged from the first version (52.46 % / 52.75 %): the new features
+and the blend improved validation (52.9 % / 53.7 %) but not the test period. What improved is
+the probabilities: they are calibrated, and the confidence tiers separate well.
+
+**Confidence tiers** (thresholds set on validation):
+
+| tier | share of windows | 5m accuracy | 15m accuracy |
+|---|---|---|---|
+| high | 10 % | 57.5 % | 57.2 % |
+| medium | 20 % | 54.5 % | 54.6 % |
+| low | 30 % | 52.3 % | 53.1 % |
+| none | 40 % | 50.2 % | 50.4 % |
+
+**Accuracy vs. how selective you are** — the realistic route to 54 %+:
+
+| trade only the most confident … | 100 % | 75 % | 50 % | 30 % | 20 % | 10 % | 5 % |
+|---|---|---|---|---|---|---|---|
+| 5m accuracy | 52.4 % | 53.2 % | 54.3 % | 55.5 % | 56.1 % | 57.2 % | 57.9 % |
+| 15m accuracy | 52.8 % | 53.6 % | 54.6 % | 55.5 % | 56.7 % | 57.0 % | 59.5 % |
+
+### Part-way through a window
+
+| elapsed | 5m acc | 15m acc | 15m acc, analytic baseline |
+|---|---|---|---|
+| 1 min | 65.6 % | 59.7 % | 59.5 % |
+| 2 min | 72.6 % | 63.2 % | 63.5 % |
+| 3 min | 79.2 % | 66.6 % | 67.1 % |
+| 4 min | 86.3 % | 68.8 % | 69.0 % |
+| 7 min | – | 76.0 % | 76.2 % |
+| 10 min | – | 82.7 % | 82.8 % |
+| 14 min | – | 93.4 % | 93.5 % |
+
+The partial-window model ranks outcomes about as well as the analytic formula
+Φ(move / (σ·√time left)) but its probabilities are better (lower log-loss at every minute,
+calibration error 0.3–2 %), which is what matters when comparing with Polymarket prices.
+
+### What the predictor returns
+
+`Predictor.predict()` → per window: `p_up` (calibrated), `side`, `confidence` = P(predicted side),
+`tier` (high / medium / low / none) with that tier's backtest accuracy, and `spread` (standard
+deviation of the six members' probabilities: high spread = the models disagree).
+`Predictor.partial(move, elapsed_min, H)` → P(Up) for a window in progress.
 
 ## Caveats
 
@@ -68,10 +107,38 @@ windows a bettor would actually trade.
 
 ## Live estimator
 
-`live.py` predicts every Polymarket BTC 5m / 15m window at its open, then every 15 s
-compares its fair value (model prior blended with the move so far) with the Polymarket
-best ask, net of the crypto taker fee (`shares × p × 0.25 × (p(1−p))²`). It paper-buys one
-share when the edge after fees is at least `--min-edge` (default 0.03). No orders are placed.
+`live.py` predicts every Polymarket BTC 5m / 15m window at its open (calibrated P(Up),
+confidence tier, model spread). Once a minute it refreshes candles and features; every 15 s it
+turns the move so far into a fair value with the partial-window model, compares it with the
+Polymarket best ask net of the crypto taker fee (`shares × p × 0.25 × (p(1−p))²`), and logs the
+edge and a Kelly stake fraction. It paper-buys one share when the edge after fees is at least
+`--min-edge` (default 0.03). `logs/live_summary.json` tracks accuracy overall, per tier, against
+Polymarket's own resolution, the Brier score, a rolling 500-window accuracy and a drift warning.
+No orders are placed.
+
+### Making it work better live
+
+1. **Settle on Chainlink, not Bitstamp.** Polymarket resolves on the Chainlink BTC/USD Data
+   Stream. Reading it from Polymarket's live-data websocket (`ws-live-data.polymarket.com`,
+   topic `crypto_prices_chainlink`) for the opening price and the move so far removes basis noise
+   that decides close calls late in a window.
+2. **Lower latency.** Replace 15 s REST polling with exchange websockets (mid price, not last
+   trade); late in a window a few seconds of lag is the whole edge.
+3. **Record order-book and flow data** (top-of-book imbalance, trade flow, perp basis/funding)
+   and retrain after a few weeks; these are the strongest short-horizon signals and are absent
+   from the historical data used here.
+4. **Only act on high/medium tiers.** The bottom 40 % of windows is a coin flip.
+5. **Use limit (maker) orders.** Taker fees reach 1.56 % at 50 ¢, larger than much of the edge;
+   makers pay no fee and earn rebates.
+6. **Size with fractional Kelly** (a quarter of `kelly_up` / `kelly_down` in the quotes log).
+7. **Retrain weekly** (`train_final.py`, `train_intra.py` refit to the latest data); accuracy
+   drifts month to month.
+8. **Stop when `drift_warning` fires** in `live_summary.json` (rolling accuracy < 49 % over
+   300+ windows).
+9. **Judge it against the market, not 50 %.** After a few weeks, `logs/quotes/` gives the real
+   benchmark: did buying when fair − ask − fee > 0 make money?
+10. **Add other coins** (ETH, SOL, …) for pretraining and as cross-asset features once a data
+    host such as `data.binance.vision` is reachable.
 
 ### Running on GitHub Actions (no computer needed)
 
@@ -108,9 +175,8 @@ Needs outbound access to `www.bitstamp.net` (or `api.exchange.coinbase.com` /
 
 ```
 python -m btcpred.data          # 1-minute grid cache
-python train_gbm.py             # GBM
-python train_nn.py 3 5          # NN: pretrain epochs, fine-tune epochs
-python ensemble.py              # blend + backtest
-python walkforward.py           # optional robustness check
-python refit_live.py            # refit GBMs on all recent data for live use
+python train_nn.py 3 5 0 2      # NN: pretrain epochs, fine-tune epochs, seed, pretrain stride
+python train_final.py           # GBM members + blend + calibration + tiers + live refits
+python train_intra.py           # partial-window models (+ live refits)
+python experiments.py           # optional: the variants compared on validation
 ```

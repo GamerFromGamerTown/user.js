@@ -11,9 +11,12 @@ from btcpred import dataset as ds, features
 from btcpred.model import Net
 from btcpred.metrics import report
 
+import sys
+SEED = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+PRE_STRIDE = int(sys.argv[4]) if len(sys.argv) > 4 else 3
 torch.set_num_threads(4)
-torch.manual_seed(0)
-np.random.seed(0)
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 os.makedirs("models", exist_ok=True)
 
 d = ds.load()
@@ -22,7 +25,7 @@ Y = np.column_stack([d["y5"], d["y15"], d["r5"], d["r15"]]).astype(np.float32)
 Y = np.nan_to_num(Y)
 tie = np.column_stack([d["r5"] == 0, d["r15"] == 0])
 
-pre = ds.split_idx(ts, "pretrain", stride=3)
+pre = ds.split_idx(ts, "pretrain", stride=PRE_STRIDE)
 mu, sd = X[pre].mean(0), X[pre].std(0) + 1e-6
 Xn = ((X - mu) / sd).astype(np.float32)
 
@@ -92,7 +95,6 @@ def run(net, idx, epochs, lr, tag, bs=4096, patience=2):
 
 
 if __name__ == "__main__":
-    import sys
     pre_epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     ft_epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 4
     net = Net(X.shape[1])
@@ -104,9 +106,10 @@ if __name__ == "__main__":
     ft = ds.split_idx(ts, "finetune")
     print(f"finetune n={len(ft)}", flush=True)
     net = run(net, ft, ft_epochs, 5e-4, "finetune")
-    torch.save({"state": net.state_dict(), "mu": mu, "sd": sd, "n_feat": X.shape[1]}, "models/nn.pt")
+    tag = "" if SEED == 0 else f"_s{SEED}"
+    torch.save({"state": net.state_dict(), "mu": mu, "sd": sd, "n_feat": X.shape[1]}, f"models/nn{tag}.pt")
     p5, p15 = predict(net, te5)[:, 0], predict(net, te15)[:, 1]
     report("test5 NN", d["y5"][te5], p5)
     report("test15 NN", d["y15"][te15], p15)
-    np.savez("data/nn_test_preds.npz", te5=te5, te15=te15, p5=p5, p15=p15,
+    np.savez(f"data/nn_test_preds{tag}.npz", te5=te5, te15=te15, p5=p5, p15=p15,
              v5=predict(net, va5)[:, 0], v15=predict(net, va15)[:, 1])

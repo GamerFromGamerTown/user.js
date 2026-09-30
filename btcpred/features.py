@@ -51,6 +51,35 @@ def build(d):
     f["tod_s"], f["tod_c"] = np.sin(2 * np.pi * tod), np.cos(2 * np.pi * tod)
     f["dow_s"], f["dow_c"] = np.sin(2 * np.pi * dow), np.cos(2 * np.pi * dow)
     f["m15"] = (ts % 900) / 900.0  # position inside the 15-minute block
+    # --- v2 features
+    for j in range(10):  # the last ten 1-minute moves individually
+        f[f"r1_l{j}"] = np.roll(r1, j) / s
+    n = len(ts)
+    for name, period in (("day", 1440), ("hour", 60), ("q", 15)):  # move since the block opened
+        m = (ts // 60) % period
+        f[f"since_{name}"] = (lc - lc[np.maximum(np.arange(n) - m, 0)]) / (s * np.sqrt(np.maximum(m, 1)))
+    for k in (4320, 10080):  # multi-day trend, in units of daily-scaled 1-minute vol
+        f[f"zd{k}"] = (lc - np.roll(lc, k)) / (vol[1440] * np.sqrt(k))
+    f["frac1000"] = (c % 1000) / 1000.0  # distance to round-number prices
+    f["frac100"] = (c % 100) / 100.0
+    up = (r1 > 0).astype(float)
+    for w in (15, 60):
+        f[f"upfrac{w}"] = _roll(up, w, "mean")
+    f["skew60"] = _roll(r1, 60, "skew")
+    f["skew240"] = _roll(r1, 240, "skew")
+    r1s = pd.Series(r1)
+    f["ac60"] = r1s.rolling(60, min_periods=60).corr(r1s.shift(1)).values  # 1-lag autocorrelation
+    lvz = (lv - _roll(lv, 1440, "mean")) / (_roll(lv, 1440, "std") + 1e-6)
+    for j in range(3):
+        f[f"vz_l{j}"] = np.roll(lvz, j)
+    vm60 = _roll(v, 60, "mean") + 1e-9
+    f["sv1"] = sv / vm60
+    f["sv3"] = _roll(sv, 3, "sum") / (3 * vm60)
+    pk = np.sqrt(_roll((lh - ll) ** 2, 60, "mean") / (4 * np.log(2)))
+    f["pk_ratio"] = np.log((pk + 1e-9) / s)
+    f["moh"] = ((ts // 60) % 60).astype(float)
+    f["hod"] = ((ts // 3600) % 24).astype(float)
+    f["dow"] = (((ts // 86400) + 4) % 7).astype(float)
     X = np.column_stack([np.nan_to_num(f[k], nan=0.0, posinf=0.0, neginf=0.0) for k in f]).astype(np.float32)
     X = np.clip(X, -20, 20)
     ys = {}

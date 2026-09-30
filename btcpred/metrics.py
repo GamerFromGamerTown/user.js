@@ -1,6 +1,20 @@
 import numpy as np
 
 
+def calibration(y, p, bins=10):
+    """Expected calibration error and a reliability table over equal-count bins of p."""
+    y, p = np.asarray(y, float), np.asarray(p, float)
+    order = np.argsort(p)
+    table, ece = [], 0.0
+    for chunk in np.array_split(order, bins):
+        if len(chunk) == 0:
+            continue
+        pm, ym = p[chunk].mean(), y[chunk].mean()
+        ece += len(chunk) / len(p) * abs(pm - ym)
+        table.append((float(pm), float(ym), int(len(chunk))))
+    return {"ece": float(ece), "table": table}
+
+
 def report(tag, y, p, quiet=False):
     """Accuracy overall and on the most confident fractions (where a bettor would act)."""
     y, p = np.asarray(y), np.asarray(p)

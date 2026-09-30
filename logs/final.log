@@ -1,0 +1,26 @@
+5m member v1: iters=190
+5m member big: iters=214
+5m member xt: iters=221
+5m member long: iters=195
+5m member reg: iters=256
+=== 5m: NN weight 0.30, Platt a=1.159 b=0.0071
+[val5 ensemble] n=51839 acc=0.5289 (±0.0022 1SE) logloss=0.69056 base_up=0.5045 | top50%=0.5458(n=25920) top20%=0.5665(n=10368) top10%=0.5795(n=5184)
+[test5 ensemble] n=51870 acc=0.5241 (±0.0022 1SE) logloss=0.69094 base_up=0.5012 | top50%=0.5433(n=25935) top20%=0.5614(n=10374) top10%=0.5724(n=5187)
+   tier high    share=0.10 test_acc=0.5748
+   tier medium  share=0.20 test_acc=0.5451
+   tier low     share=0.30 test_acc=0.5225
+   tier none    share=0.40 test_acc=0.5021
+   coverage->acc: {'1.0': 0.5241, '0.75': 0.5315, '0.5': 0.5433, '0.3': 0.5552, '0.2': 0.5614, '0.1': 0.5724, '0.05': 0.5786}
+15m member v1: iters=199
+15m member big: iters=134
+15m member xt: iters=446
+15m member long: iters=248
+15m member reg: iters=316
+=== 15m: NN weight 0.25, Platt a=1.053 b=-0.0082
+[val15 ensemble] n=17279 acc=0.5374 (±0.0038 1SE) logloss=0.68832 base_up=0.5023 | top50%=0.5641(n=8640) top20%=0.5940(n=3456) top10%=0.6013(n=1728)
+[test15 ensemble] n=17290 acc=0.5276 (±0.0038 1SE) logloss=0.69091 base_up=0.4970 | top50%=0.5464(n=8645) top20%=0.5665(n=3458) top10%=0.5697(n=1729)
+   tier high    share=0.10 test_acc=0.5718
+   tier medium  share=0.20 test_acc=0.5462
+   tier low     share=0.30 test_acc=0.5311
+   tier none    share=0.40 test_acc=0.5044
+   coverage->acc: {'1.0': 0.5276, '0.75': 0.5361, '0.5': 0.5464, '0.3': 0.5547, '0.2': 0.5665, '0.1': 0.5697, '0.05': 0.5954}
