@@ -1,0 +1,7 @@
+numpy
+pandas
+pyarrow
+lightgbm
+scikit-learn
+torch
+requests

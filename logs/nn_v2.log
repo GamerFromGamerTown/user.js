@@ -1,0 +1,12 @@
+pretrain n=2303571
+[pretrain] ep0 loss=0.73715 val_ll=1.38468 val5_acc=0.5200 val15_acc=0.5348 (153s)
+[pretrain] ep1 loss=0.73206 val_ll=1.38512 val5_acc=0.5193 val15_acc=0.5360 (143s)
+[pretrain] ep2 loss=0.73054 val_ll=1.38527 val5_acc=0.5204 val15_acc=0.5342 (137s)
+finetune n=1442878
+[finetune] ep0 loss=0.77938 val_ll=1.38059 val5_acc=0.5223 val15_acc=0.5343 (93s)
+[finetune] ep1 loss=0.77797 val_ll=1.38050 val5_acc=0.5240 val15_acc=0.5310 (92s)
+[finetune] ep2 loss=0.77730 val_ll=1.38009 val5_acc=0.5259 val15_acc=0.5357 (85s)
+[finetune] ep3 loss=0.77686 val_ll=1.38027 val5_acc=0.5239 val15_acc=0.5347 (91s)
+[finetune] ep4 loss=0.77672 val_ll=1.38019 val5_acc=0.5243 val15_acc=0.5353 (85s)
+[test5 NN] n=51870 acc=0.5234 (±0.0022 1SE) logloss=0.69125 base_up=0.5012 | top50%=0.5390(n=25935) top20%=0.5556(n=10374) top10%=0.5616(n=5187)
+[test15 NN] n=17290 acc=0.5242 (±0.0038 1SE) logloss=0.69183 base_up=0.4970 | top50%=0.5400(n=8645) top20%=0.5529(n=3458) top10%=0.5616(n=1729)

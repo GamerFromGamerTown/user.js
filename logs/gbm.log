@@ -1,0 +1,8 @@
+--- GBM 5m  train=finetune n_train=709179 best_iter=237
+[val] n=51839 acc=0.5231 (±0.0022 1SE) logloss=0.69110 base_up=0.5045 | top50%=0.5400(n=25920) top20%=0.5594(n=10368) top10%=0.5723(n=5184)
+[test] n=51870 acc=0.5230 (±0.0022 1SE) logloss=0.69134 base_up=0.5012 | top50%=0.5380(n=25935) top20%=0.5560(n=10374) top10%=0.5645(n=5187)
+top features: ema30, z1440, ema120, tod_c, m15, tod_s, ema480, lvol1440, lvol60, pos60
+--- GBM 15m  train=finetune n_train=715502 best_iter=142
+[val] n=17279 acc=0.5374 (±0.0038 1SE) logloss=0.68898 base_up=0.5023 | top50%=0.5619(n=8640) top20%=0.5952(n=3456) top10%=0.5903(n=1728)
+[test] n=17290 acc=0.5288 (±0.0038 1SE) logloss=0.69049 base_up=0.4970 | top50%=0.5459(n=8645) top20%=0.5651(n=3458) top10%=0.5957(n=1729)
+top features: ema120, tod_c, z1440, tod_s, ema480, lvol1440, lvol240, dow_s, v60, rng240
